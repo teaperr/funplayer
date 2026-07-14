@@ -1,0 +1,20 @@
+[project]
+name = "funplayer"
+version = "0.1.0"
+description = "Linux funscript player with Intiface/Buttplug sync (ScriptPlayer equivalent)"
+requires-python = ">=3.11"
+dependencies = [
+    "PySide6>=6.6",
+    "python-mpv>=1.0.4",
+    "websockets>=12.0",
+]
+
+[project.scripts]
+funplayer = "funplayer.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["funplayer*"]

@@ -45,9 +45,36 @@
 
           dontWrapQtApps = false;
         };
+        funplayerDesktopItem = pkgs.makeDesktopItem {
+          name = "funplayer";
+          desktopName = "FunPlayer";
+          comment = "Funscript player with Intiface/Buttplug sync";
+          exec = "${funplayer}/bin/funplayer %f";
+          # Swap for a real icon file if/when you add one to the repo, e.g.:
+          # icon = ./assets/funplayer.png;
+          icon = "multimedia-player";
+          categories = [
+            "AudioVideo"
+            "Player"
+          ];
+          mimeTypes = [
+            "video/mp4"
+            "video/x-matroska"
+            "audio/mpeg"
+          ];
+        };
+
+        funplayerWithDesktop = pkgs.symlinkJoin {
+          name = "funplayer-with-desktop";
+          paths = [
+            funplayer
+            funplayerDesktopItem
+          ];
+        };
       in
       {
-        packages.default = funplayer;
+        packages.default = funplayerWithDesktop;
+        packages.funplayer = funplayer;
         apps.default = {
           type = "app";
           program = "${funplayer}/bin/funplayer";

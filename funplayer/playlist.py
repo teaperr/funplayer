@@ -19,16 +19,24 @@ _FUZZY_SUFFIX_RE = re.compile(r"[\s._-]*\(?\b(19|20)\d{2}\b\)?\s*$")
 
 @dataclass
 class PlaylistItem:
-    media_path: str
+    media_path: str | None   # None = script-only item, no accompanying media
     script_path: str | None
 
     @property
     def name(self) -> str:
-        return Path(self.media_path).name
+        if self.media_path:
+            return Path(self.media_path).name
+        if self.script_path:
+            return f"{Path(self.script_path).name} (script only)"
+        return "Unknown"
 
     @property
     def has_script(self) -> bool:
         return bool(self.script_path)
+
+    @property
+    def is_script_only(self) -> bool:
+        return self.media_path is None
 
 
 def _fuzzy_key(stem: str) -> str:
@@ -159,6 +167,6 @@ class Playlist:
         pl = cls()
         pl.shuffle = data.get("shuffle", False)
         pl.repeat_mode = data.get("repeat_mode", "off")
-        items = [PlaylistItem(i["media"], i.get("script")) for i in data.get("items", [])]
+        items = [PlaylistItem(i.get("media"), i.get("script")) for i in data.get("items", [])]
         pl.set_items(items)
         return pl

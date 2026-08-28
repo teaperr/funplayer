@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSlider,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -23,6 +24,7 @@ from ..config import Settings
 from ..funscript import Funscript
 from ..player import MpvPlayer
 from ..playlist import MEDIA_EXTS, Playlist, PlaylistItem, pair_folder
+from ..script_clock import ScriptClock
 from ..sync_engine import SyncEngine
 from .calibration_dialog import CalibrationDialog
 from .playlist_widget import PlaylistWidget
@@ -120,7 +122,9 @@ class MainWindow(QMainWindow):
         self.buttplug.devices_changed.connect(self._on_devices_changed)
         self.buttplug.error.connect(self._on_buttplug_error)
 
-        self._player: MpvPlayer | None = None
+        self._player: MpvPlayer | None = None          # created lazily in showEvent (needs a native window)
+        self._script_clock = ScriptClock()              # available immediately, no media needed
+        self._active_player = self._script_clock         # whichever is actually driving playback right now
         self._sync: SyncEngine | None = None
         self._current_script: Funscript | None = None
         self._seeking = False
@@ -144,6 +148,14 @@ class MainWindow(QMainWindow):
         self.video_widget.setAttribute(Qt.WA_NativeWindow)
         self.video_widget.setStyleSheet("background-color: black;")
 
+        self.script_only_label = QLabel("Script only \u2014 no video")
+        self.script_only_label.setAlignment(Qt.AlignCenter)
+        self.script_only_label.setStyleSheet("background-color: black; color: #888; font-size: 16px;")
+
+        self.media_stack = QStackedWidget()
+        self.media_stack.addWidget(self.video_widget)        # index 0
+        self.media_stack.addWidget(self.script_only_label)   # index 1
+
         self.heatmap = HeatmapWidget()
         self.heatmap.seek_requested.connect(self._on_heatmap_seek)
 
@@ -156,9 +168,9 @@ class MainWindow(QMainWindow):
 
         self.play_btn = QPushButton("Play")
         self.play_btn.clicked.connect(self._toggle_play)
-        self.prev_btn = QPushButton("⏮")
+        self.prev_btn = QPushButton("\u23ee")
         self.prev_btn.clicked.connect(self._play_previous)
-        self.next_btn = QPushButton("⏭")
+        self.next_btn = QPushButton("\u23ed")
         self.next_btn.clicked.connect(self._play_next)
 
         self.volume_slider = QSlider(Qt.Horizontal)
@@ -201,7 +213,7 @@ class MainWindow(QMainWindow):
         transport.addWidget(self.status_label)
 
         central_layout = QVBoxLayout()
-        central_layout.addWidget(self.video_widget, stretch=1)
+        central_layout.addWidget(self.media_stack, stretch=1)
         central_layout.addWidget(self.heatmap)
         central_layout.addWidget(self.seek_slider)
         central_layout.addLayout(transport)
@@ -224,6 +236,15 @@ class MainWindow(QMainWindow):
 
         self.playlist_widget.playlist_path_changed.connect(self._on_playlist_path_changed)
 
+        # ScriptClock is available immediately (no native window needed), so
+        # wire its signals up now; MpvPlayer's equivalent connections happen
+        # in showEvent once it's constructed. Both feed the same handlers --
+        # each handler checks self.sender() so updates from whichever
+        # source isn't currently active get ignored.
+        self._script_clock.position_changed.connect(self._on_position_changed)
+        self._script_clock.duration_changed.connect(self._on_duration_changed)
+        self._script_clock.playback_ended.connect(self._on_playback_ended)
+
     def _build_menu(self) -> None:
         menu = self.menuBar().addMenu("File")
 
@@ -234,6 +255,10 @@ class MainWindow(QMainWindow):
         open_folder = QAction("Open Folder (build playlist)...", self)
         open_folder.triggered.connect(self._open_folder)
         menu.addAction(open_folder)
+
+        open_script_only = QAction("Open Funscript (no video)...", self)
+        open_script_only.triggered.connect(self._open_script_only)
+        menu.addAction(open_script_only)
 
         menu.addSeparator()
         settings_action = QAction("Settings...", self)
@@ -261,6 +286,9 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence(Qt.Key_Down), self, activated=lambda: self._adjust_volume(-5))
         QShortcut(QKeySequence("N"), self, activated=self._play_next)
         QShortcut(QKeySequence("P"), self, activated=self._play_previous)
+        QShortcut(QKeySequence("Ctrl+Q"), self, activated=self.close)
+        QShortcut(QKeySequence("Ctrl+Right"), self, activated=self._play_next)
+        QShortcut(QKeySequence("Ctrl+Left"), self, activated=self._play_previous)
 
     # ---- lifecycle ----
 
@@ -273,7 +301,7 @@ class MainWindow(QMainWindow):
             self._player.playback_ended.connect(self._on_playback_ended)
             self._player.set_volume(self.settings.volume)
             self._player.speed = self._speed
-            self._sync = SyncEngine(self._player, self.buttplug, self.settings)
+            self._sync = SyncEngine(self._active_player, self.buttplug, self.settings)
 
     def closeEvent(self, event) -> None:
         self.settings.shuffle = self.playlist.shuffle
@@ -283,6 +311,7 @@ class MainWindow(QMainWindow):
             self._sync.stop()
         if self._player:
             self._player.shutdown()
+        self._script_clock.shutdown()
         self.buttplug.shutdown()
         super().closeEvent(event)
 
@@ -301,6 +330,8 @@ class MainWindow(QMainWindow):
                 new_items.extend(pair_folder(pp, fuzzy=self.settings.fuzzy_script_matching))
             elif pp.suffix.lower() in MEDIA_EXTS:
                 new_items.append(PlaylistItem(str(pp), _guess_script(str(pp))))
+            elif pp.suffix.lower() == ".funscript":
+                new_items.append(PlaylistItem(None, str(pp)))
         if new_items:
             was_empty = not self.playlist.items
             self.playlist.add_items(new_items)
@@ -328,6 +359,16 @@ class MainWindow(QMainWindow):
         self.playlist_widget.refresh()
         if items:
             self._play_index(0)
+
+    def _open_script_only(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open funscript", self.settings.default_media_folder, "Funscript (*.funscript)"
+        )
+        if not path:
+            return
+        self.playlist.add_items([PlaylistItem(None, path)])
+        self.playlist_widget.refresh()
+        self._play_index(len(self.playlist.items) - 1)
 
     def _try_restore_last_playlist(self) -> None:
         path = self.settings.last_playlist_path
@@ -357,10 +398,19 @@ class MainWindow(QMainWindow):
         self._load_item(item)
 
     def _load_item(self, item: PlaylistItem) -> None:
-        if self._player is None:
-            return
-        self._player.load(item.media_path)
-        self._player.play()
+        if item.is_script_only:
+            if self._player:
+                self._player.pause()
+            self.media_stack.setCurrentWidget(self.script_only_label)
+            new_active = self._script_clock
+        else:
+            if self._player is None:
+                return
+            self._script_clock.pause()
+            self.media_stack.setCurrentWidget(self.video_widget)
+            self._player.load(item.media_path)
+            self._player.play()
+            new_active = self._player
 
         if item.script_path and Path(item.script_path).exists():
             try:
@@ -371,10 +421,18 @@ class MainWindow(QMainWindow):
         else:
             self._current_script = None
 
+        if item.is_script_only:
+            duration_s = (self._current_script.duration_ms / 1000.0) if self._current_script else 0.0
+            self._script_clock.set_duration(duration_s)
+            self._script_clock.seek(0)
+            self._script_clock.play()
+
+        self._active_player = new_active
         if self._sync:
+            self._sync.set_player(self._active_player)
             self._sync.load_script(self._current_script)
         self.heatmap.set_script(self._current_script)
-        self.setWindowTitle(f"FunPlayer — {item.name}")
+        self.setWindowTitle(f"FunPlayer \u2014 {item.name}")
 
     def _play_next(self) -> None:
         item = self.playlist.next()
@@ -391,6 +449,8 @@ class MainWindow(QMainWindow):
             self._load_item(item)
 
     def _on_playback_ended(self) -> None:
+        if self.sender() is not self._active_player:
+            return
         if not self.settings.auto_play_next:
             return
         delay = self.settings.inter_video_delay_ms
@@ -412,14 +472,11 @@ class MainWindow(QMainWindow):
     # ---- transport ----
 
     def _toggle_play(self) -> None:
-        if self._player is None:
-            return
-        self._player.toggle_pause()
-        self.play_btn.setText("Play" if self._player.is_paused else "Pause")
+        self._active_player.toggle_pause()
+        self.play_btn.setText("Play" if self._active_player.is_paused else "Pause")
 
     def _seek_relative(self, delta_seconds: float) -> None:
-        if self._player:
-            self._player.seek_relative(delta_seconds)
+        self._active_player.seek_relative(delta_seconds)
 
     def _adjust_volume(self, delta: int) -> None:
         self.volume_slider.setValue(max(0, min(100, self.volume_slider.value() + delta)))
@@ -432,6 +489,7 @@ class MainWindow(QMainWindow):
         self._speed = value
         if self._player:
             self._player.speed = value
+        self._script_clock.speed = value
 
     def _on_volume_changed(self, value: int) -> None:
         self.settings.volume = value
@@ -439,9 +497,11 @@ class MainWindow(QMainWindow):
             self._player.set_volume(value)
 
     def _on_position_changed(self, seconds: float) -> None:
-        if self._seeking or self._player is None:
+        if self.sender() is not self._active_player:
             return
-        duration = self._player.duration
+        if self._seeking:
+            return
+        duration = self._active_player.duration
         if duration > 0:
             self.seek_slider.blockSignals(True)
             self.seek_slider.setValue(int((seconds / duration) * 1000))
@@ -453,15 +513,13 @@ class MainWindow(QMainWindow):
 
     def _on_seek_released(self) -> None:
         self._seeking = False
-        if self._player is None:
-            return
-        duration = self._player.duration
+        duration = self._active_player.duration
         target = (self.seek_slider.value() / 1000) * duration
-        self._player.seek(target)
+        self._active_player.seek(target)
 
     def _on_heatmap_seek(self, fraction: float) -> None:
-        if self._player and self._player.duration > 0:
-            self._player.seek(fraction * self._player.duration)
+        if self._active_player.duration > 0:
+            self._active_player.seek(fraction * self._active_player.duration)
 
     # ---- buttplug ----
 
@@ -485,6 +543,15 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Not connected")
             self.connect_btn.setText("Connect")
             self.device_combo.clear()
+            # Explicit, not relying on clear() indirectly firing
+            # currentIndexChanged -> _on_device_selected(None): if the sync
+            # engine keeps a stale Device reference after an unexpected
+            # disconnect, it keeps trying to send to it on every tick,
+            # which used to spam the (now-removed) error dialog into a
+            # crash-like pileup. See buttplug_client._reset_connection_state
+            # for the other half of this fix.
+            if self._sync:
+                self._sync.set_device(None)
 
     def _on_devices_changed(self, devices: list[Device]) -> None:
         self.device_combo.clear()
@@ -505,8 +572,12 @@ class MainWindow(QMainWindow):
             self.settings.preferred_device_name = device.name
 
     def _on_buttplug_error(self, message: str) -> None:
-        self.status_label.setText("Error")
-        QMessageBox.warning(self, "Intiface / Buttplug", message)
+        # Deliberately not a modal QMessageBox: if something (like a stale
+        # device reference during a disconnect race) causes repeated rapid
+        # errors, a blocking dialog per error is exactly what turned into a
+        # crash-like pileup of nested modal loops before. A transient
+        # status message can't stack up the same way.
+        self.status_label.setText(f"Error: {message}")
 
     def _run_test_pattern(self) -> None:
         device = self.device_combo.currentData()
@@ -531,10 +602,10 @@ class MainWindow(QMainWindow):
     # ---- calibration ----
 
     def _open_calibration(self) -> None:
-        if self._current_script is None or self._player is None:
+        if self._current_script is None:
             QMessageBox.information(self, "Calibrate Offset", "Load a video with a funscript first.")
             return
-        dlg = CalibrationDialog(self._current_script, self._player, self)
+        dlg = CalibrationDialog(self._current_script, self._active_player, self)
         if dlg.exec():
             offset = dlg.result_offset_ms()
             if offset is not None:

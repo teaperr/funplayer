@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QObject, QTimer
+import threading
+import time
+
+from PySide6.QtCore import QObject
 
 from .buttplug_client import ButtplugClient, Device
 from .config import Settings
 from .funscript import Action, Funscript
-from .player import MpvPlayer
 
 
 def smoothed_actions(actions: list[Action], window: int) -> list[Action]:
@@ -36,90 +38,115 @@ def _catmull_rom(p0: float, p1: float, p2: float, p3: float, t: float) -> float:
 
 
 class SyncEngine(QObject):
-    """Drives the toy from a funscript + mpv playback position.
+    """Drives the toy from a funscript + a playback clock's position.
 
-    Linear devices are driven event-driven, same core design as before:
-    each command is scheduled to land exactly when the device should reach
-    its target, chained to the next command as soon as one fires, and every
-    call recomputes its position fresh from the real playback time -- so
-    seeks/pauses/resumes just self-correct with no separate drift-tracking
-    needed for the common case, and dense/fast passages never get
-    under-sampled the way a fixed-rate tick would sample them.
+    The "player" is anything exposing .position / .speed / .is_paused and a
+    paused_changed signal -- MpvPlayer for video/audio items, or ScriptClock
+    for funscript-only playback with no accompanying media. set_player()
+    lets the active source be swapped at runtime as the playlist moves
+    between the two kinds of items.
 
-    What's new: each real funscript segment (the span between two actual
-    script waypoints) is *subdivided* into evenly-timed sub-steps when the
-    segment is long enough to benefit -- e.g. a slow 500ms stroke gets
-    several smoothly-curved intermediate commands instead of one straight
-    linear move. Short/fast segments (typical of dense high-SPM passages)
-    naturally collapse to a single sub-step, i.e. exactly the original
-    direct point-to-point behavior -- so this never reintroduces the
-    fixed-tick under-sampling problem. Sub-step timing is always derived
-    from the *real* segment duration, never from an arbitrary tick rate, so
-    speed is never artificially forced to a tight/incorrect deadline.
+    Runs entirely on its own background thread, independent of Qt's main
+    GUI event loop, so a stalled/throttled GUI/render thread (e.g. some
+    compositors throttle unfocused/occluded windows) can't block Buttplug
+    command delivery. Buttplug's client is already thread-safe (dispatches
+    via asyncio.run_coroutine_threadsafe internally) and libmpv's property
+    reads are safe from any thread, so nothing here needs Qt's event loop
+    at all -- it only inherits QObject so it can receive paused_changed.
 
-    Interpolation curve used for sub-stepping (settings.interp_algorithm):
-      - "linear": straight blend between the two surrounding points.
-      - "smoothstep": eased blend, gentler acceleration in/out of each point.
-      - "catmull_rom": cubic spline through the surrounding four points.
-      - "step": no sub-stepping at all, one command straight to each real
-        waypoint (closest to simple on/off-style toys, or for A/B testing
-        against the interpolated modes).
+    Linear devices are driven event-driven: each command is scheduled (via
+    a monotonic-clock deadline, not a Qt timer) to land exactly when the
+    device should reach its target, chained to the next command as soon as
+    one is due, and every step recomputes its position fresh from the real
+    playback time -- so seeks/pauses/resumes self-correct with no separate
+    drift-tracking needed for the common case, and dense/fast passages
+    never get under-sampled the way a fixed-rate tick would sample them.
 
-    A periodic monitor tick provides a safety net: if actual playback drifts
-    more than one script index away from what the in-flight chain expects
-    (e.g. a seek landed while a long sub-step's timer was still pending),
-    it restarts the chain immediately instead of waiting for the stale
-    timer to fire.
+    Each real funscript segment is subdivided into evenly-timed sub-steps
+    when the segment is long enough to benefit, shaped by
+    settings.interp_algorithm ("linear" / "smoothstep" / "catmull_rom" /
+    "step").
 
-    Vibration-only devices are driven from the same monitor tick, since
+    A periodic monitor pass provides a safety net: if actual playback
+    drifts more than one script index away from what the in-flight chain
+    expects, it restarts the chain immediately instead of waiting for the
+    stale deadline.
+
+    Vibration-only devices are driven from the same monitor pass, since
     there's no "arrival time" concept for a vibration level.
     """
 
-    def __init__(self, player: MpvPlayer, buttplug: ButtplugClient, settings: Settings) -> None:
+    _LOOP_RESOLUTION_S = 0.01  # internal scheduling granularity
+
+    def __init__(self, player, buttplug: ButtplugClient, settings: Settings) -> None:
         super().__init__()
         self._player = player
         self._buttplug = buttplug
-        self._settings = settings
 
+        self._lock = threading.Lock()
+        self._settings = settings
         self._raw_actions: list[Action] | None = None
         self._effective: Funscript | None = None
         self._effective_smoothing_window = 1
-
         self._device: Device | None = None
+        self._paused = player.is_paused
 
         self._expected_idx = -2          # base index of the segment our in-flight command belongs to
         self._last_sent_raw_pos: float | None = None
         self._last_vibrate_scalar: float | None = None
 
-        self._step_timer = QTimer(self)
-        self._step_timer.setSingleShot(True)
-        self._step_timer.timeout.connect(self._schedule_next_linear)
-
-        self._monitor_timer = QTimer(self)
-        self._monitor_timer.timeout.connect(self._monitor_tick)
-        self._monitor_timer.start(settings.sync_tick_ms)
+        self._chain_dirty = True         # forces an immediate resync on next loop pass
+        self._running = True
 
         player.paused_changed.connect(self._on_pause_changed)
 
+        self._thread = threading.Thread(target=self._run_loop, daemon=True, name="SyncEngine")
+        self._thread.start()
+
+    # ---- public API (thread-safe: callers are on the Qt main thread) ----
+
+    def set_player(self, player) -> None:
+        """Swap the active playback clock (e.g. switching between an
+        MpvPlayer-backed item and a ScriptClock-backed script-only item)."""
+        try:
+            self._player.paused_changed.disconnect(self._on_pause_changed)
+        except (RuntimeError, TypeError):
+            pass
+        self._player = player
+        player.paused_changed.connect(self._on_pause_changed)
+        with self._lock:
+            self._paused = player.is_paused
+            self._chain_dirty = True
+
     def set_device(self, device: Device | None) -> None:
-        self._device = device
-        self._restart_linear_chain()
+        with self._lock:
+            self._device = device
+            self._chain_dirty = True
 
     def load_script(self, script: Funscript | None) -> None:
-        self._raw_actions = list(script.actions) if script else None
-        self._rebuild_effective()
-        self._last_vibrate_scalar = None
-        self._restart_linear_chain()
+        with self._lock:
+            self._raw_actions = list(script.actions) if script else None
+            self._rebuild_effective_locked()
+            self._last_vibrate_scalar = None
+            self._chain_dirty = True
 
     def apply_settings(self, settings: Settings) -> None:
-        old_window = self._settings.smoothing_window
-        self._settings = settings
-        self._monitor_timer.setInterval(settings.sync_tick_ms)
-        if settings.smoothing_window != old_window:
-            self._rebuild_effective()
-            self._restart_linear_chain()
+        with self._lock:
+            old_window = self._settings.smoothing_window
+            self._settings = settings
+            if settings.smoothing_window != old_window:
+                self._rebuild_effective_locked()
+                self._chain_dirty = True
 
-    def _rebuild_effective(self) -> None:
+    def stop(self) -> None:
+        self._running = False
+        self._thread.join(timeout=1.0)
+        if self._device is not None:
+            self._buttplug.stop_device(self._device.index)
+
+    # ---- internal: must hold self._lock when calling ----
+
+    def _rebuild_effective_locked(self) -> None:
         if self._raw_actions is None:
             self._effective = None
             return
@@ -129,69 +156,89 @@ class SyncEngine(QObject):
         self._effective_smoothing_window = window
 
     def _on_pause_changed(self, paused: bool) -> None:
-        if paused:
-            self._step_timer.stop()
-            if self._device is not None:
-                self._buttplug.stop_device(self._device.index)
-        else:
-            self._restart_linear_chain()
+        with self._lock:
+            self._paused = paused
+            self._chain_dirty = True
+        if paused and self._device is not None:
+            self._buttplug.stop_device(self._device.index)
 
-    def _restart_linear_chain(self) -> None:
-        self._step_timer.stop()
-        self._expected_idx = -2
-        self._last_sent_raw_pos = None
-        if not self._player.is_paused:
-            self._schedule_next_linear()
+    def _current_ms(self, settings: Settings) -> float:
+        return self._player.position * 1000.0 + settings.global_offset_ms
 
-    def _current_ms(self) -> float:
-        return self._player.position * 1000.0 + self._settings.global_offset_ms
+    # ---- background thread loop ----
+
+    def _run_loop(self) -> None:
+        next_linear_deadline = 0.0
+        next_monitor_deadline = 0.0
+
+        while self._running:
+            now = time.monotonic()
+
+            with self._lock:
+                settings = self._settings
+                device = self._device
+                effective = self._effective
+                paused = self._paused
+                dirty = self._chain_dirty
+                if dirty:
+                    self._chain_dirty = False
+                    self._last_sent_raw_pos = None
+                    self._expected_idx = -2
+
+            if dirty:
+                next_linear_deadline = now
+
+            if device is not None and effective is not None and effective.actions and not paused:
+                if now >= next_linear_deadline:
+                    wait_s = self._schedule_next_linear(effective, device, settings)
+                    next_linear_deadline = now + (wait_s if wait_s is not None else self._LOOP_RESOLUTION_S)
+            else:
+                next_linear_deadline = now
+
+            monitor_interval_s = max(0.01, settings.sync_tick_ms / 1000.0)
+            if now >= next_monitor_deadline:
+                self._monitor_pass(effective, device, settings, paused)
+                next_monitor_deadline = now + monitor_interval_s
+
+            time.sleep(self._LOOP_RESOLUTION_S)
 
     # ---- linear (event-driven chain with curved sub-stepping) ----
 
-    def _curve_value(self, idx: int, prev: Action, nxt: Action, t: float) -> float:
-        algo = self._settings.interp_algorithm
-
+    def _curve_value(self, effective: Funscript, idx: int, prev: Action, nxt: Action, t: float, algo: str) -> float:
         if algo == "smoothstep":
             return prev.pos + (nxt.pos - prev.pos) * _smoothstep(t)
 
         if algo == "catmull_rom":
-            before = self._effective.action_at(idx - 1) or prev
-            after = self._effective.action_at(idx + 2) or nxt
+            before = effective.action_at(idx - 1) or prev
+            after = effective.action_at(idx + 2) or nxt
             return _catmull_rom(before.pos, prev.pos, nxt.pos, after.pos, t)
 
         # "linear" and any unrecognized value fall back to a plain blend
         return prev.pos + (nxt.pos - prev.pos) * t
 
-    def _schedule_next_linear(self) -> None:
-        if self._effective is None or self._device is None or not self._effective.actions:
-            return
-        if self._settings.device_mode not in ("auto", "linear") or not self._device.has_linear:
-            return
-        if self._player.is_paused:
-            return
+    def _schedule_next_linear(self, effective: Funscript, device: Device, s: Settings) -> float | None:
+        """Sends the next command if one is due. Returns how many seconds
+        to wait before this should be called again (None = nothing to do
+        right now, use the default poll resolution)."""
+        if s.device_mode not in ("auto", "linear") or not device.has_linear:
+            return None
 
-        s = self._settings
-        current_ms = self._current_ms()
-        idx = self._effective.index_at_or_before(current_ms)
-        prev = self._effective.action_at(idx)
-        nxt = self._effective.action_at(idx + 1)
+        current_ms = self._current_ms(s)
+        idx = effective.index_at_or_before(current_ms)
+        prev = effective.action_at(idx)
+        nxt = effective.action_at(idx + 1)
         if nxt is None:
             self._expected_idx = idx
-            return  # reached end of script, nothing left to schedule
+            return None  # reached end of script, nothing left to schedule
 
         speed = max(0.1, self._player.speed)
 
         if prev is None or s.interp_algorithm == "step":
-            # nothing to sub-divide against (script hasn't started yet), or
-            # sub-stepping disabled: one direct command straight to the
-            # real waypoint, exactly like plain point-to-point behavior.
             raw_pos = float(nxt.pos)
             target_at_ms = float(nxt.at_ms)
         else:
             span = max(1, nxt.at_ms - prev.at_ms)
             real_duration_ms = span / speed
-            # sub-step granularity aims for roughly sync_tick_ms per step;
-            # short/fast segments collapse to a single step naturally.
             num_substeps = max(1, round(real_duration_ms / max(1, s.sync_tick_ms)))
             t_frac = max(0.0, min(1.0, (current_ms - prev.at_ms) / span))
             substep_index = min(num_substeps - 1, int(t_frac * num_substeps))
@@ -200,10 +247,10 @@ class SyncEngine(QObject):
             if target_t >= 1.0:
                 raw_pos = float(nxt.pos)  # land exactly on the real waypoint, no float drift
             else:
-                raw_pos = self._curve_value(idx, prev, nxt, target_t)
+                raw_pos = self._curve_value(effective, idx, prev, nxt, target_t, s.interp_algorithm)
             target_at_ms = prev.at_ms + target_t * span
 
-        target = self._effective.apply_range(raw_pos, s.min_position_pct, s.max_position_pct, s.invert_position)
+        target = effective.apply_range(raw_pos, s.min_position_pct, s.max_position_pct, s.invert_position)
         duration_ms = max(20.0, (target_at_ms - current_ms) / speed) * s.command_overlap
 
         if s.max_speed_units_per_s > 0 and self._last_sent_raw_pos is not None:
@@ -211,49 +258,42 @@ class SyncEngine(QObject):
             min_duration_for_speed = (delta_units / s.max_speed_units_per_s) * 1000
             duration_ms = max(duration_ms, min_duration_for_speed)
 
-        self._buttplug.send_linear(
-            self._device.index, self._device.linear_feature_index, target, int(duration_ms)
-        )
+        self._buttplug.send_linear(device.index, device.linear_feature_index, target, int(duration_ms))
         self._last_sent_raw_pos = raw_pos
         self._expected_idx = idx
 
-        # fire again exactly when the device should be arriving at this target
-        self._step_timer.start(max(1, int(duration_ms)))
+        return duration_ms / 1000.0
 
     # ---- vibrate + safety-net monitor ----
 
-    def _monitor_tick(self) -> None:
-        # pick up live smoothing-window changes without needing a reload
-        if self._settings.smoothing_window != self._effective_smoothing_window:
-            self._rebuild_effective()
-            self._restart_linear_chain()
+    def _monitor_pass(self, effective: Funscript | None, device: Device | None, s: Settings, paused: bool) -> None:
+        with self._lock:
+            if self._settings.smoothing_window != self._effective_smoothing_window:
+                self._rebuild_effective_locked()
+                self._chain_dirty = True
+                return
 
-        if self._effective is None or self._device is None or self._player.is_paused:
+        if effective is None or device is None or paused or not effective.actions:
             return
-        current_ms = self._current_ms()
+        current_ms = self._current_ms(s)
 
-        if self._settings.device_mode in ("auto", "linear") and self._device.has_linear:
-            idx_now = self._effective.index_at_or_before(current_ms)
+        if s.device_mode in ("auto", "linear") and device.has_linear:
+            idx_now = effective.index_at_or_before(current_ms)
             if abs(idx_now - self._expected_idx) > 1:
-                self._restart_linear_chain()
-        elif self._settings.device_mode in ("auto", "vibrate") and self._device.has_scalar_vibrate:
-            self._drive_vibrate(current_ms)
+                with self._lock:
+                    self._chain_dirty = True
+        elif s.device_mode in ("auto", "vibrate") and device.has_scalar_vibrate:
+            self._drive_vibrate(effective, device, s, current_ms)
 
-    def _drive_vibrate(self, current_ms: float) -> None:
-        idx = self._effective.index_at_or_before(current_ms)
-        action = self._effective.action_at(idx) or (self._effective.actions[0] if self._effective.actions else None)
+    def _drive_vibrate(self, effective: Funscript, device: Device, s: Settings, current_ms: float) -> None:
+        idx = effective.index_at_or_before(current_ms)
+        action = effective.action_at(idx) or (effective.actions[0] if effective.actions else None)
         if action is None:
             return
-        s = self._settings
-        norm = self._effective.apply_range(action.pos, s.min_position_pct, s.max_position_pct, s.invert_position)
+        norm = effective.apply_range(action.pos, s.min_position_pct, s.max_position_pct, s.invert_position)
         scalar = s.vibrate_min_scalar + norm * (s.vibrate_max_scalar - s.vibrate_min_scalar)
 
         if self._last_vibrate_scalar is not None and abs(scalar - self._last_vibrate_scalar) < 0.02:
             return
         self._last_vibrate_scalar = scalar
-        self._buttplug.send_scalar_vibrate(self._device.index, self._device.scalar_feature_index, scalar)
-
-    def stop(self) -> None:
-        self._step_timer.stop()
-        if self._device is not None:
-            self._buttplug.stop_device(self._device.index)
+        self._buttplug.send_scalar_vibrate(device.index, device.scalar_feature_index, scalar)

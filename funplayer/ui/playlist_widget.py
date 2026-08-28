@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
 )
 
-from ..playlist import Playlist, PlaylistItem, pair_folder
+from ..playlist import SCRIPT_EXTS, Playlist, PlaylistItem, pair_folder
 
 
 class PlaylistWidget(QWidget):
@@ -80,10 +80,25 @@ class PlaylistWidget(QWidget):
         self.item_activated.emit(self.list_widget.row(item))
 
     def _on_add_files(self) -> None:
-        paths, _ = QFileDialog.getOpenFileNames(self, "Add media files")
+        # Accepts media files and lone .funscript files in the same dialog --
+        # a selected .funscript becomes a script-only entry directly, no
+        # separate "Open Funscript" step needed for the common case of just
+        # wanting to queue up a script on its own.
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Add files",
+            filter="Media or Funscript (*.funscript *.mp4 *.mkv *.webm *.avi *.mov *.wmv *.flv *.m4v "
+            "*.mpg *.mpeg *.ts *.m2ts *.ogv *.3gp *.mp3 *.flac *.wav *.ogg *.m4a *.aac *.opus *.wma);;"
+            "All files (*)",
+        )
         if not paths:
             return
-        new_items = [PlaylistItem(p, _guess_script(p)) for p in paths]
+        new_items = []
+        for p in paths:
+            if p.lower().endswith(tuple(SCRIPT_EXTS)):
+                new_items.append(PlaylistItem(None, p))
+            else:
+                new_items.append(PlaylistItem(p, _guess_script(p)))
         self.playlist.add_items(new_items)
         self.refresh()
 

@@ -169,7 +169,26 @@ class ButtplugClient(QObject):
                 await self._ws.close()
             except Exception:
                 pass
-            self._ws = None
+        self._reset_connection_state()
+
+    def _reset_connection_state(self) -> None:
+        """Common cleanup for both a deliberate disconnect and the server
+        closing the connection on its own (Intiface quitting, device
+        manager restarting, etc.) -- both need to leave the client in the
+        same clean state. Previously the unexpected-closure path in
+        _recv_loop only flipped self._is_connected and emitted `connected`,
+        but left self._ws pointing at a dead (closed, non-None) socket
+        object. Every subsequent send from SyncEngine's background thread
+        (which keeps ticking regardless) would then hit _send()'s
+        `if self._ws is None: return` guard, find it *not* None, actually
+        attempt to send on the dead socket, raise, and emit `error` --
+        every single tick, ~25/sec. Each one triggered a blocking modal
+        QMessageBox in the UI, so within a second or two dozens of nested
+        modal dialogs piled up, which is what actually presented as a
+        crash/hang. Setting self._ws back to None here closes that off at
+        the source, matching what a manual disconnect already did.
+        """
+        self._ws = None
         self._is_connected = False
         self._devices.clear()
         self.connected.emit(False)
@@ -196,10 +215,16 @@ class ButtplugClient(QObject):
                 for entry in payload:
                     self._handle_message(entry)
         except websockets.ConnectionClosed:
-            self._is_connected = False
-            self.connected.emit(False)
+            self._reset_connection_state()
         except Exception as exc:
             self.error.emit(f"Buttplug receive error: {exc}")
+            self._reset_connection_state()
+        else:
+            # async-for ended without an exception -- some websockets
+            # versions surface a clean server-initiated close this way
+            # instead of raising. Still need the same cleanup.
+            if self._ws is not None:
+                self._reset_connection_state()
 
     def _handle_message(self, entry: dict) -> None:
         if "ServerInfo" in entry:

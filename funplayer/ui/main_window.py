@@ -5,6 +5,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QKeySequence, QPainter, QShortcut
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDockWidget,
     QFileDialog,
@@ -184,6 +185,23 @@ class MainWindow(QMainWindow):
         self.speed_combo.setCurrentText("1x")
         self.speed_combo.currentTextChanged.connect(self._on_speed_changed)
 
+        # Shuffle/repeat live directly in the transport bar (not inside the
+        # playlist dock) specifically so they stay reachable even when that
+        # dock is closed -- previously they were only accessible through the
+        # dock's own widget and disappeared along with it.
+        self.shuffle_check = QCheckBox("Shuffle")
+        self.shuffle_check.setLayoutDirection(Qt.RightToLeft)
+        self.shuffle_check.setChecked(self.settings.shuffle)
+        self.shuffle_check.toggled.connect(self._on_shuffle_toggled)
+
+        self.repeat_combo = QComboBox()
+        self.repeat_combo.addItems(["off", "one", "all"])
+        self.repeat_combo.setCurrentText(self.settings.repeat_mode)
+        self.repeat_combo.currentTextChanged.connect(self._on_repeat_changed)
+
+        self.fullscreen_btn = QPushButton("Fullscreen")
+        self.fullscreen_btn.clicked.connect(self._toggle_fullscreen)
+
         self.device_combo = QComboBox()
         self.device_combo.setMinimumWidth(180)
         self.device_combo.currentIndexChanged.connect(self._on_device_selected)
@@ -205,6 +223,9 @@ class MainWindow(QMainWindow):
         transport.addWidget(self.volume_slider)
         transport.addWidget(QLabel("Speed:"))
         transport.addWidget(self.speed_combo)
+        transport.addWidget(self.shuffle_check)
+        transport.addWidget(self.repeat_combo)
+        transport.addWidget(self.fullscreen_btn)
         transport.addStretch(1)
         transport.addWidget(QLabel("Device:"))
         transport.addWidget(self.device_combo)
@@ -222,12 +243,8 @@ class MainWindow(QMainWindow):
         central.setLayout(central_layout)
         self.setCentralWidget(central)
 
-        self.playlist_widget = PlaylistWidget(self.playlist)
+        self.playlist_widget = PlaylistWidget(self.playlist, self.settings)
         self.playlist_widget.item_activated.connect(self._play_index)
-        self.playlist_widget.shuffle_toggled.connect(self._on_shuffle_toggled)
-        self.playlist_widget.repeat_mode_changed.connect(self._on_repeat_changed)
-        self.playlist_widget.shuffle_check.setChecked(self.settings.shuffle)
-        self.playlist_widget.repeat_combo.setCurrentText(self.settings.repeat_mode)
 
         dock = QDockWidget("Playlist", self)
         dock.setWidget(self.playlist_widget)
@@ -267,11 +284,18 @@ class MainWindow(QMainWindow):
 
         menu.addSeparator()
         quit_action = QAction("Quit", self)
+        quit_action.setShortcut(QKeySequence("Ctrl+Q"))
         quit_action.triggered.connect(self.close)
         menu.addAction(quit_action)
 
         view_menu = self.menuBar().addMenu("View")
         view_menu.addAction(self.playlist_dock.toggleViewAction())
+
+        # Populated on demand from settings.playlists_folder, so switching
+        # playlists doesn't mean re-browsing the filesystem every time --
+        # just point this at a folder once in Settings and pick from here.
+        self.playlists_menu = self.menuBar().addMenu("Playlists")
+        self.playlists_menu.aboutToShow.connect(self._rebuild_playlists_menu)
 
         tools_menu = self.menuBar().addMenu("Tools")
         calibrate_action = QAction("Calibrate Offset...", self)
@@ -289,6 +313,8 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+Q"), self, activated=self.close)
         QShortcut(QKeySequence("Ctrl+Right"), self, activated=self._play_next)
         QShortcut(QKeySequence("Ctrl+Left"), self, activated=self._play_previous)
+        QShortcut(QKeySequence("F11"), self, activated=self._toggle_fullscreen)
+        QShortcut(QKeySequence(Qt.Key_Escape), self, activated=self._exit_fullscreen)
 
     # ---- lifecycle ----
 
@@ -389,6 +415,37 @@ class MainWindow(QMainWindow):
     def _on_playlist_path_changed(self, path: str) -> None:
         self.settings.last_playlist_path = path
         self.settings.save()
+
+    def _rebuild_playlists_menu(self) -> None:
+        self.playlists_menu.clear()
+        folder = self.settings.playlists_folder
+        if not folder or not Path(folder).is_dir():
+            action = QAction("Set a playlists folder in Settings...", self)
+            action.setEnabled(False)
+            self.playlists_menu.addAction(action)
+            return
+        json_files = sorted(Path(folder).glob("*.json"))
+        if not json_files:
+            action = QAction("(no playlists found)", self)
+            action.setEnabled(False)
+            self.playlists_menu.addAction(action)
+            return
+        for p in json_files:
+            action = QAction(p.stem, self)
+            action.triggered.connect(lambda checked=False, path=str(p): self._load_playlist_file(path))
+            self.playlists_menu.addAction(action)
+
+    def _load_playlist_file(self, path: str) -> None:
+        try:
+            loaded = Playlist.load(path)
+        except Exception as exc:
+            QMessageBox.warning(self, "Load playlist", f"Could not load {path}:\n{exc}")
+            return
+        self.playlist.set_items(loaded.items)
+        self.playlist_widget.refresh()
+        self._on_playlist_path_changed(path)
+        if self.playlist.items:
+            self._play_index(0)
 
     def _play_index(self, index: int) -> None:
         item = self.playlist.select_index(index)
@@ -521,6 +578,20 @@ class MainWindow(QMainWindow):
         if self._active_player.duration > 0:
             self._active_player.seek(fraction * self._active_player.duration)
 
+    # ---- fullscreen ----
+
+    def _toggle_fullscreen(self) -> None:
+        if self.isFullScreen():
+            self.showNormal()
+            self.fullscreen_btn.setText("Fullscreen")
+        else:
+            self.showFullScreen()
+            self.fullscreen_btn.setText("Exit Fullscreen")
+
+    def _exit_fullscreen(self) -> None:
+        if self.isFullScreen():
+            self._toggle_fullscreen()
+
     # ---- buttplug ----
 
     def _toggle_connection(self) -> None:
@@ -547,9 +618,9 @@ class MainWindow(QMainWindow):
             # currentIndexChanged -> _on_device_selected(None): if the sync
             # engine keeps a stale Device reference after an unexpected
             # disconnect, it keeps trying to send to it on every tick,
-            # which used to spam the (now-removed) error dialog into a
-            # crash-like pileup. See buttplug_client._reset_connection_state
-            # for the other half of this fix.
+            # which used to spam a blocking error dialog into a crash-like
+            # pileup. See buttplug_client._reset_connection_state for the
+            # other half of this fix.
             if self._sync:
                 self._sync.set_device(None)
 

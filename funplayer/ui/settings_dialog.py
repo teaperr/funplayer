@@ -8,8 +8,11 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
+    QHBoxLayout,
     QLineEdit,
+    QPushButton,
     QSpinBox,
     QTabWidget,
     QVBoxLayout,
@@ -215,5 +218,23 @@ class SettingsDialog(QDialog):
         folder = QLineEdit(self._settings.default_media_folder)
         folder.textChanged.connect(lambda v: setattr(self._settings, "default_media_folder", v))
         form.addRow("Default media folder", folder)
+
+        playlists_folder_row = QHBoxLayout()
+        playlists_folder = QLineEdit(self._settings.playlists_folder)
+        playlists_folder.setPlaceholderText("Folder to scan for quick-switch playlists")
+        playlists_folder.textChanged.connect(lambda v: setattr(self._settings, "playlists_folder", v))
+        browse_btn = QPushButton("Browse...")
+
+        def _browse() -> None:
+            chosen = QFileDialog.getExistingDirectory(
+                self, "Playlists folder", playlists_folder.text() or self._settings.default_media_folder
+            )
+            if chosen:
+                playlists_folder.setText(chosen)
+
+        browse_btn.clicked.connect(_browse)
+        playlists_folder_row.addWidget(playlists_folder)
+        playlists_folder_row.addWidget(browse_btn)
+        form.addRow("Playlists folder", playlists_folder_row)
 
         return w

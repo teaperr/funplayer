@@ -1,31 +1,35 @@
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QComboBox,
     QFileDialog,
     QHBoxLayout,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QPushButton,
     QVBoxLayout,
     QWidget,
-    QCheckBox,
 )
 
+from ..config import Settings
 from ..playlist import SCRIPT_EXTS, Playlist, PlaylistItem, pair_folder
 
 
 class PlaylistWidget(QWidget):
     item_activated = Signal(int)          # emits index into playlist.items
-    shuffle_toggled = Signal(bool)
-    repeat_mode_changed = Signal(str)
     playlist_path_changed = Signal(str)   # emits path whenever a playlist file is saved/loaded
 
-    def __init__(self, playlist: Playlist, parent=None) -> None:
+    def __init__(self, playlist: Playlist, settings: Settings, parent=None) -> None:
         super().__init__(parent)
         self.playlist = playlist
+        self.settings = settings
+        self._filtered_indices: list[int] = []
+
+        self.search_box = QLineEdit()
+        self.search_box.setPlaceholderText("Search playlist...")
+        self.search_box.textChanged.connect(self.refresh)
 
         self.list_widget = QListWidget()
         self.list_widget.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -37,47 +41,50 @@ class PlaylistWidget(QWidget):
         self.save_btn = QPushButton("Save Playlist")
         self.load_btn = QPushButton("Load Playlist")
 
-        self.shuffle_check = QCheckBox("Shuffle")
-        self.shuffle_check.setLayoutDirection(Qt.RightToLeft)
-        self.repeat_combo = QComboBox()
-        self.repeat_combo.addItems(["off", "one", "all"])
-
         self.add_files_btn.clicked.connect(self._on_add_files)
         self.add_folder_btn.clicked.connect(self._on_add_folder)
         self.remove_btn.clicked.connect(self._on_remove)
         self.save_btn.clicked.connect(self._on_save)
         self.load_btn.clicked.connect(self._on_load)
-        self.shuffle_check.toggled.connect(self.shuffle_toggled.emit)
-        self.repeat_combo.currentTextChanged.connect(self.repeat_mode_changed.emit)
 
         top_row = QHBoxLayout()
         for b in (self.add_files_btn, self.add_folder_btn, self.remove_btn):
             top_row.addWidget(b)
 
         bottom_row = QHBoxLayout()
-        bottom_row.addWidget(self.shuffle_check)
-        bottom_row.addWidget(self.repeat_combo)
         bottom_row.addWidget(self.save_btn)
         bottom_row.addWidget(self.load_btn)
 
         layout = QVBoxLayout(self)
         layout.addLayout(top_row)
+        layout.addWidget(self.search_box)
         layout.addWidget(self.list_widget)
         layout.addLayout(bottom_row)
 
     def refresh(self) -> None:
         self.list_widget.clear()
-        for item in self.playlist.items:
+        query = self.search_box.text().strip().lower()
+        self._filtered_indices = []
+        for idx, item in enumerate(self.playlist.items):
+            if query and query not in item.name.lower():
+                continue
             label = item.name if item.has_script else f"{item.name}  [no script]"
             self.list_widget.addItem(QListWidgetItem(label))
+            self._filtered_indices.append(idx)
 
     def highlight_current(self, index: int) -> None:
-        self.list_widget.setCurrentRow(index)
+        if index in self._filtered_indices:
+            self.list_widget.setCurrentRow(self._filtered_indices.index(index))
+        else:
+            # currently-playing item is filtered out of view by the search box
+            self.list_widget.clearSelection()
 
     # ---- handlers ----
 
     def _on_item_double_clicked(self, item: QListWidgetItem) -> None:
-        self.item_activated.emit(self.list_widget.row(item))
+        row = self.list_widget.row(item)
+        if 0 <= row < len(self._filtered_indices):
+            self.item_activated.emit(self._filtered_indices[row])
 
     def _on_add_files(self) -> None:
         # Accepts media files and lone .funscript files in the same dialog --
@@ -87,6 +94,7 @@ class PlaylistWidget(QWidget):
         paths, _ = QFileDialog.getOpenFileNames(
             self,
             "Add files",
+            self.settings.default_media_folder,
             filter="Media or Funscript (*.funscript *.mp4 *.mkv *.webm *.avi *.mov *.wmv *.flv *.m4v "
             "*.mpg *.mpeg *.ts *.m2ts *.ogv *.3gp *.mp3 *.flac *.wav *.ogg *.m4a *.aac *.opus *.wma);;"
             "All files (*)",
@@ -103,34 +111,38 @@ class PlaylistWidget(QWidget):
         self.refresh()
 
     def _on_add_folder(self) -> None:
-        folder = QFileDialog.getExistingDirectory(self, "Add folder")
+        folder = QFileDialog.getExistingDirectory(self, "Add folder", self.settings.default_media_folder)
         if not folder:
             return
-        self.playlist.add_items(pair_folder(folder))
+        self.playlist.add_items(pair_folder(folder, fuzzy=self.settings.fuzzy_script_matching))
         self.refresh()
 
     def _on_remove(self) -> None:
         row = self.list_widget.currentRow()
-        if row >= 0:
-            self.playlist.remove_at(row)
+        if 0 <= row < len(self._filtered_indices):
+            self.playlist.remove_at(self._filtered_indices[row])
             self.refresh()
 
+    def _start_dir(self) -> str:
+        return self.settings.playlists_folder or self.settings.default_media_folder
+
     def _on_save(self) -> None:
-        path, _ = QFileDialog.getSaveFileName(self, "Save playlist", filter="Playlist (*.json)")
+        path, _ = QFileDialog.getSaveFileName(self, "Save playlist", self._start_dir(), filter="Playlist (*.json)")
         if path:
             self.playlist.save(path)
             self.playlist_path_changed.emit(path)
 
     def _on_load(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Load playlist", filter="Playlist (*.json)")
+        path, _ = QFileDialog.getOpenFileName(self, "Load playlist", self._start_dir(), filter="Playlist (*.json)")
         if not path:
             return
+        # Only the item list is restored here -- shuffle/repeat state is
+        # owned by Settings (see MainWindow._on_shuffle_toggled /
+        # _on_repeat_changed), not by individual playlist files, to avoid
+        # a saved file's stale shuffle/repeat silently overriding the
+        # current session state.
         loaded = Playlist.load(path)
         self.playlist.set_items(loaded.items)
-        self.playlist.shuffle = loaded.shuffle
-        self.playlist.repeat_mode = loaded.repeat_mode
-        self.shuffle_check.setChecked(loaded.shuffle)
-        self.repeat_combo.setCurrentText(loaded.repeat_mode)
         self.refresh()
         self.playlist_path_changed.emit(path)
 

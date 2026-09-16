@@ -55,11 +55,12 @@ class Settings:
     inter_video_delay_ms: int = 0    # pause between auto-advancing to the next item
     default_media_folder: str = str(Path.home())
     restore_last_playlist: bool = True
+    last_playlist_path: str = ""
+    playlists_folder: str = ""       # folder scanned for quick-switch playlists (File > Playlists menu)
 
     # --- UI ---
     theme: str = "dark"              # "dark" | "light" | "system"
     show_script_heatmap: bool = True
-    last_playlist_path: str = ""
 
     def save(self) -> None:
         with open(config_path(), "w", encoding="utf-8") as f:

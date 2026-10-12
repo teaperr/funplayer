@@ -9,8 +9,17 @@ os.environ["QT_QPA_PLATFORM"] = "xcb"
 from PySide6.QtWidgets import QApplication
 
 from .config import Settings
-from .theme import ThemeManager
 from .ui.main_window import MainWindow
+
+DARK_QSS = """
+QWidget { background-color: #232323; color: #e0e0e0; }
+QPushButton { background-color: #3a3a3a; border: 1px solid #4a4a4a; padding: 4px 10px; border-radius: 3px; }
+QPushButton:hover { background-color: #454545; }
+QSlider::groove:horizontal { background: #444; height: 4px; }
+QSlider::handle:horizontal { background: #9a9a9a; width: 12px; margin: -5px 0; border-radius: 6px; }
+QListWidget, QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox { background-color: #2b2b2b; border: 1px solid #444; }
+"""
+
 
 def main() -> int:
     settings = Settings.load()
@@ -18,11 +27,10 @@ def main() -> int:
     app = QApplication(sys.argv)
     locale.setlocale(locale.LC_NUMERIC, "C")
     app.setApplicationName("FunPlayer")
-    theme = ThemeManager(app, settings)
-    theme.apply()
+    if settings.theme == "dark":
+        app.setStyleSheet(DARK_QSS)
 
     window = MainWindow(settings)
-    window.settings_applied.connect(theme.apply)
     window.show()
 
     argv_files = [a for a in sys.argv[1:] if not a.startswith("-")]

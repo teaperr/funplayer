@@ -57,12 +57,9 @@ class Settings:
     restore_last_playlist: bool = True
     last_playlist_path: str = ""
     playlists_folder: str = ""       # folder scanned for quick-switch playlists (File > Playlists menu)
-    last_build_folder: str = ""      # folder last used to build/update the playlist (File > Rescan)
-    playlist_sort_key: str = "manual"   # "manual" | "modified" | "name" | "length"
-    playlist_sort_descending: bool = False
 
     # --- UI ---
-    theme: str = "system"            # "dark" | "light" | "system" (follow desktop)
+    theme: str = "dark"              # "dark" | "light" | "system"
     show_script_heatmap: bool = True
 
     def save(self) -> None:

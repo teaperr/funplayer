@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 VIDEO_EXTS = {
     ".mp4", ".mkv", ".webm", ".avi", ".mov", ".wmv", ".flv", ".m4v",
@@ -15,6 +17,8 @@ MEDIA_EXTS = VIDEO_EXTS | AUDIO_EXTS
 SCRIPT_EXTS = {".funscript"}
 
 _FUZZY_SUFFIX_RE = re.compile(r"[\s._-]*\(?\b(19|20)\d{2}\b\)?\s*$")
+
+SORT_KEYS = ("manual", "modified", "name", "length")
 
 
 @dataclass
@@ -31,12 +35,49 @@ class PlaylistItem:
         return "Unknown"
 
     @property
+    def primary_path(self) -> str | None:
+        """The file that identifies this item: the media, or the script for script-only items."""
+        return self.media_path or self.script_path
+
+    @property
     def has_script(self) -> bool:
         return bool(self.script_path)
 
     @property
     def is_script_only(self) -> bool:
         return self.media_path is None
+
+
+def item_key(item: PlaylistItem) -> str:
+    """Identity used for duplicate detection (resolves symlinks / relative paths)."""
+    path = item.primary_path or ""
+    try:
+        return os.path.normcase(os.path.realpath(path))
+    except OSError:
+        return os.path.normcase(os.path.abspath(path))
+
+
+def _natural_key(text: str) -> list:
+    # re.split with a capture group alternates str, digit-str, str, ... so
+    # positions are type-consistent between any two keys.
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", text.lower())]
+
+
+def _mtime(item: PlaylistItem) -> float:
+    path = item.primary_path
+    try:
+        return os.stat(path).st_mtime if path else 0.0
+    except OSError:
+        return 0.0
+
+
+def merge_summary(total: int, added: int, updated: int) -> str:
+    skipped = max(0, total - added - updated)
+    parts = [f"Added {added} new"]
+    if updated:
+        parts.append(f"updated {updated} with a newly found script")
+    parts.append(f"{skipped} already in playlist")
+    return ", ".join(parts)
 
 
 def _fuzzy_key(stem: str) -> str:
@@ -82,9 +123,77 @@ class Playlist:
         self.items = items
         self._rebuild_order(keep_current=None)
 
-    def add_items(self, items: list[PlaylistItem]) -> None:
-        self.items.extend(items)
-        self._rebuild_order(keep_current=self.current_item())
+    def add_items(self, items: list[PlaylistItem]) -> tuple[int, int]:
+        """Merge items into the playlist without creating duplicates.
+
+        An incoming item whose media file (or script file, for script-only
+        items) is already present is skipped -- except that if the existing
+        entry has no script and the incoming one does, the script is filled
+        in. That is what lets re-scanning a folder pick up scripts that
+        appeared after the video was first added.
+
+        Returns (added, updated).
+        """
+        index = {item_key(i): i for i in self.items}
+        added = updated = 0
+        for new in items:
+            key = item_key(new)
+            existing = index.get(key)
+            if existing is None:
+                self.items.append(new)
+                index[key] = new
+                added += 1
+            elif not existing.script_path and new.script_path:
+                existing.script_path = new.script_path
+                updated += 1
+        if added:
+            self._rebuild_order(keep_current=self.current_item())
+        return added, updated
+
+    def find(self, item: PlaylistItem) -> int:
+        """Index of the playlist entry with the same identity as item, or -1."""
+        key = item_key(item)
+        for idx, existing in enumerate(self.items):
+            if item_key(existing) == key:
+                return idx
+        return -1
+
+    def sort_items(
+        self,
+        key: str,
+        descending: bool = False,
+        duration_of: Callable[[PlaylistItem], float | None] | None = None,
+    ) -> bool:
+        """Reorder self.items in place. key: manual | modified | name | length.
+
+        Items with an unknown length always sort last for key == "length".
+        The currently playing item stays current. Returns True if the order changed.
+        """
+        if key not in SORT_KEYS or key == "manual" or len(self.items) < 2:
+            return False
+        before = list(self.items)
+        current = self.current_item()
+
+        def name_key(i: PlaylistItem) -> list:
+            return _natural_key(Path(i.primary_path).name if i.primary_path else "")
+
+        if key == "name":
+            self.items.sort(key=name_key, reverse=descending)
+        elif key == "modified":
+            mt = {id(i): _mtime(i) for i in self.items}
+            self.items.sort(key=lambda i: (mt[id(i)], name_key(i)), reverse=descending)
+        else:  # length
+            lengths = {id(i): (duration_of(i) if duration_of else None) for i in self.items}
+            known = [i for i in self.items if lengths[id(i)] is not None]
+            unknown = [i for i in self.items if lengths[id(i)] is None]
+            known.sort(key=lambda i: (lengths[id(i)], name_key(i)), reverse=descending)
+            unknown.sort(key=name_key)
+            self.items[:] = known + unknown
+
+        changed = any(a is not b for a, b in zip(before, self.items))
+        if changed:
+            self._rebuild_order(keep_current=current)
+        return changed
 
     def clear(self) -> None:
         self.items = []
@@ -102,15 +211,22 @@ class Playlist:
 
     def _rebuild_order(self, keep_current: PlaylistItem | None) -> None:
         self._order = list(range(len(self.items)))
+        cur_idx = -1
+        if keep_current is not None:
+            # identity, not equality: items are mutated/reordered in place
+            cur_idx = next((i for i, x in enumerate(self.items) if x is keep_current), -1)
         if self.shuffle:
             random.shuffle(self._order)
-        if keep_current is not None and keep_current in self.items:
-            idx = self.items.index(keep_current)
-            pos_in_order = self._order.index(idx)
-            self._order[0], self._order[pos_in_order] = self._order[pos_in_order], self._order[0]
-            self._pos = 0
+            if cur_idx >= 0:
+                pos_in_order = self._order.index(cur_idx)
+                self._order[0], self._order[pos_in_order] = self._order[pos_in_order], self._order[0]
+                self._pos = 0
+            else:
+                self._pos = -1
         else:
-            self._pos = -1
+            # Sequential order: keep the playhead where the current item
+            # actually sits, so "next" is still the item after it.
+            self._pos = cur_idx
 
     def current_item(self) -> PlaylistItem | None:
         if 0 <= self._pos < len(self._order):

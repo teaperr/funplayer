@@ -32,7 +32,7 @@ Add to flake-based home-manager config:
 
 ```nix
 {
-  inputs.funplayer.url = "github:teaperr/funplayer";
+  inputs.funplayer.url = "path:/absolute/path/to/funplayer";
 
   # in your home-manager module imports:
   imports = [ funplayer.homeManagerModules.default ];

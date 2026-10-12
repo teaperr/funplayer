@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import fields
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, Signal
@@ -24,7 +25,7 @@ from ..buttplug_client import ButtplugClient, Device
 from ..config import Settings
 from ..funscript import Funscript
 from ..player import MpvPlayer
-from ..playlist import MEDIA_EXTS, Playlist, PlaylistItem, pair_folder
+from ..playlist import MEDIA_EXTS, Playlist, PlaylistItem, merge_summary, pair_folder
 from ..script_clock import ScriptClock
 from ..sync_engine import SyncEngine
 from .calibration_dialog import CalibrationDialog
@@ -107,6 +108,8 @@ class HeatmapWidget(QWidget):
 
 
 class MainWindow(QMainWindow):
+    settings_applied = Signal()  # emitted after the settings dialog is accepted
+
     def __init__(self, settings: Settings) -> None:
         super().__init__()
         self.setWindowTitle("FunPlayer")
@@ -252,6 +255,7 @@ class MainWindow(QMainWindow):
         self.playlist_dock = dock
 
         self.playlist_widget.playlist_path_changed.connect(self._on_playlist_path_changed)
+        self.playlist_widget.status_message.connect(lambda msg: self.statusBar().showMessage(msg, 6000))
 
         # ScriptClock is available immediately (no native window needed), so
         # wire its signals up now; MpvPlayer's equivalent connections happen
@@ -269,9 +273,18 @@ class MainWindow(QMainWindow):
         open_file.triggered.connect(self._open_file)
         menu.addAction(open_file)
 
-        open_folder = QAction("Open Folder (build playlist)...", self)
+        open_folder = QAction("Open Folder (build / update playlist)...", self)
         open_folder.triggered.connect(self._open_folder)
         menu.addAction(open_folder)
+
+        rescan_folder = QAction("Rescan Last Folder (add new files)", self)
+        rescan_folder.setShortcut(QKeySequence("Ctrl+R"))
+        rescan_folder.triggered.connect(self._rescan_last_folder)
+        menu.addAction(rescan_folder)
+
+        replace_folder = QAction("Replace Playlist with Folder...", self)
+        replace_folder.triggered.connect(self._replace_with_folder)
+        menu.addAction(replace_folder)
 
         open_script_only = QAction("Open Funscript (no video)...", self)
         open_script_only.triggered.connect(self._open_script_only)
@@ -333,6 +346,7 @@ class MainWindow(QMainWindow):
         self.settings.shuffle = self.playlist.shuffle
         self.settings.repeat_mode = self.playlist.repeat_mode
         self.settings.save()
+        self.playlist_widget.shutdown()
         if self._sync:
             self._sync.stop()
         if self._player:
@@ -360,8 +374,9 @@ class MainWindow(QMainWindow):
                 new_items.append(PlaylistItem(None, str(pp)))
         if new_items:
             was_empty = not self.playlist.items
-            self.playlist.add_items(new_items)
+            added, updated = self.playlist.add_items(new_items)
             self.playlist_widget.refresh()
+            self.statusBar().showMessage(merge_summary(len(new_items), added, updated), 6000)
             if was_empty:
                 self._play_index(0)
         event.acceptProposedAction()
@@ -372,16 +387,50 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "Open media", self.settings.default_media_folder)
         if not path:
             return
-        self.playlist.add_items([PlaylistItem(path, _guess_script(path))])
+        item = PlaylistItem(path, _guess_script(path))
+        self._add_and_play(item)
+
+    def _add_and_play(self, item: PlaylistItem) -> None:
+        # add_items skips duplicates and the sort may move the new entry, so
+        # look the item up afterwards instead of assuming it is last.
+        self.playlist.add_items([item])
         self.playlist_widget.refresh()
-        self._play_index(len(self.playlist.items) - 1)
+        idx = self.playlist.find(item)
+        if idx >= 0:
+            self._play_index(idx)
+
+    def _pick_folder(self, title: str) -> str:
+        start = self.settings.last_build_folder or self.settings.default_media_folder
+        return QFileDialog.getExistingDirectory(self, title, start)
 
     def _open_folder(self) -> None:
-        folder = QFileDialog.getExistingDirectory(self, "Open folder", self.settings.default_media_folder)
+        """Build/update the playlist from a folder: new files are merged in,
+        files already in the playlist are skipped (not duplicated)."""
+        folder = self._pick_folder("Open folder (adds new files to playlist)")
+        if folder:
+            self._merge_folder(folder)
+
+    def _rescan_last_folder(self) -> None:
+        folder = self.settings.last_build_folder
+        if folder and Path(folder).is_dir():
+            self._merge_folder(folder)
+        else:
+            self._open_folder()
+
+    def _merge_folder(self, folder: str) -> None:
+        was_empty = not self.playlist.items
+        self.playlist_widget.merge_folder(folder)
+        if was_empty and self.playlist.items:
+            self._play_index(0)
+
+    def _replace_with_folder(self) -> None:
+        folder = self._pick_folder("Replace playlist with folder")
         if not folder:
             return
         items = pair_folder(folder, fuzzy=self.settings.fuzzy_script_matching)
         self.playlist.set_items(items)
+        self.settings.last_build_folder = folder
+        self.settings.save()
         self.playlist_widget.refresh()
         if items:
             self._play_index(0)
@@ -392,9 +441,7 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
-        self.playlist.add_items([PlaylistItem(None, path)])
-        self.playlist_widget.refresh()
-        self._play_index(len(self.playlist.items) - 1)
+        self._add_and_play(PlaylistItem(None, path))
 
     def _try_restore_last_playlist(self) -> None:
         path = self.settings.last_playlist_path
@@ -691,8 +738,13 @@ class MainWindow(QMainWindow):
     def _open_settings(self) -> None:
         dlg = SettingsDialog(self.settings, self)
         if dlg.exec():
-            self.settings = dlg.result_settings()
+            # Copy into the existing object instead of rebinding: the playlist
+            # widget (and others) hold a reference to it and also save it.
+            new = dlg.result_settings()
+            for f in fields(new):
+                setattr(self.settings, f.name, getattr(new, f.name))
             self.settings.save()
+            self.settings_applied.emit()
             if self._sync:
                 self._sync.apply_settings(self.settings)
             self.heatmap.setVisible(self.settings.show_script_heatmap)

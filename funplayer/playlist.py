@@ -84,8 +84,13 @@ def _fuzzy_key(stem: str) -> str:
     return _FUZZY_SUFFIX_RE.sub("", stem).strip().lower()
 
 
-def pair_folder(folder: str | Path, fuzzy: bool = True) -> list[PlaylistItem]:
-    """Scan a folder for media files and pair each with a same-named .funscript."""
+def pair_folder(
+    folder: str | Path, fuzzy: bool = True, require_script: bool = False
+) -> list[PlaylistItem]:
+    """Scan a folder for media files and pair each with a same-named .funscript.
+
+    With require_script=True, media files that have no matching script are
+    left out entirely."""
     folder = Path(folder)
     media_files = [p for p in folder.rglob("*") if p.suffix.lower() in MEDIA_EXTS]
     script_files = [p for p in folder.rglob("*") if p.suffix.lower() in SCRIPT_EXTS]
@@ -107,6 +112,8 @@ def pair_folder(folder: str | Path, fuzzy: bool = True) -> list[PlaylistItem]:
         script = by_stem.get(stem.lower())
         if script is None and fuzzy:
             script = by_fuzzy.get(_fuzzy_key(stem))
+        if script is None and require_script:
+            continue
         items.append(PlaylistItem(str(mp), str(script) if script else None))
     return items
 

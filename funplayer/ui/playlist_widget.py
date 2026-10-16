@@ -217,7 +217,11 @@ class PlaylistWidget(QWidget):
     def merge_folder(self, folder: str) -> int:
         """Scan folder and merge it into the current playlist, skipping
         duplicates. Returns the number of newly added items."""
-        items = pair_folder(folder, fuzzy=self.settings.fuzzy_script_matching)
+        items = pair_folder(
+            folder,
+            fuzzy=self.settings.fuzzy_script_matching,
+            require_script=self.settings.folder_require_script,
+        )
         added, updated = self.playlist.add_items(items)
         self.settings.last_build_folder = folder
         self.settings.save()

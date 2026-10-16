@@ -47,6 +47,7 @@ class Settings:
     hwdec: str = "auto"              # mpv hwdec setting
     remember_position: bool = True
     fuzzy_script_matching: bool = True  # strip trailing "(2019)" etc. when pairing files
+    folder_require_script: bool = True  # folder scans skip videos that have no .funscript
 
     # --- Playlist ---
     shuffle: bool = False

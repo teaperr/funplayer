@@ -367,7 +367,13 @@ class MainWindow(QMainWindow):
         for p in paths:
             pp = Path(p)
             if pp.is_dir():
-                new_items.extend(pair_folder(pp, fuzzy=self.settings.fuzzy_script_matching))
+                new_items.extend(
+                    pair_folder(
+                        pp,
+                        fuzzy=self.settings.fuzzy_script_matching,
+                        require_script=self.settings.folder_require_script,
+                    )
+                )
             elif pp.suffix.lower() in MEDIA_EXTS:
                 new_items.append(PlaylistItem(str(pp), _guess_script(str(pp))))
             elif pp.suffix.lower() == ".funscript":
@@ -427,7 +433,11 @@ class MainWindow(QMainWindow):
         folder = self._pick_folder("Replace playlist with folder")
         if not folder:
             return
-        items = pair_folder(folder, fuzzy=self.settings.fuzzy_script_matching)
+        items = pair_folder(
+            folder,
+            fuzzy=self.settings.fuzzy_script_matching,
+            require_script=self.settings.folder_require_script,
+        )
         self.playlist.set_items(items)
         self.settings.last_build_folder = folder
         self.settings.save()

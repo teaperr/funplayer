@@ -197,6 +197,12 @@ class SettingsDialog(QDialog):
         fuzzy.toggled.connect(lambda v: setattr(self._settings, "fuzzy_script_matching", v))
         form.addRow("Fuzzy script/video matching", fuzzy)
 
+        require_script = QCheckBox()
+        require_script.setChecked(self._settings.folder_require_script)
+        require_script.toggled.connect(lambda v: setattr(self._settings, "folder_require_script", v))
+        require_script.setToolTip("When building a playlist from a folder, skip videos with no matching .funscript")
+        form.addRow("Skip videos without a script (folders)", require_script)
+
         auto_next = QCheckBox()
         auto_next.setChecked(self._settings.auto_play_next)
         auto_next.toggled.connect(lambda v: setattr(self._settings, "auto_play_next", v))

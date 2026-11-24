@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import fields
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QKeySequence, QPainter, QShortcut
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -236,14 +236,20 @@ class MainWindow(QMainWindow):
         transport.addWidget(self.test_pattern_btn)
         transport.addWidget(self.status_label)
 
-        central_layout = QVBoxLayout()
-        central_layout.addWidget(self.media_stack, stretch=1)
-        central_layout.addWidget(self.heatmap)
-        central_layout.addWidget(self.seek_slider)
-        central_layout.addLayout(transport)
+        # Transport lives in a widget (not a bare layout) so fullscreen can
+        # hide the whole bar in one call.
+        self.transport_bar = QWidget()
+        self.transport_bar.setLayout(transport)
+        transport.setContentsMargins(0, 0, 0, 0)
+
+        self.central_layout = QVBoxLayout()
+        self.central_layout.addWidget(self.media_stack, stretch=1)
+        self.central_layout.addWidget(self.heatmap)
+        self.central_layout.addWidget(self.seek_slider)
+        self.central_layout.addWidget(self.transport_bar)
 
         central = QWidget()
-        central.setLayout(central_layout)
+        central.setLayout(self.central_layout)
         self.setCentralWidget(central)
 
         self.playlist_widget = PlaylistWidget(self.playlist, self.settings)
@@ -327,6 +333,7 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+Right"), self, activated=self._play_next)
         QShortcut(QKeySequence("Ctrl+Left"), self, activated=self._play_previous)
         QShortcut(QKeySequence("F11"), self, activated=self._toggle_fullscreen)
+        QShortcut(QKeySequence("F"), self, activated=self._toggle_fullscreen)
         QShortcut(QKeySequence(Qt.Key_Escape), self, activated=self._exit_fullscreen)
 
     # ---- lifecycle ----
@@ -636,18 +643,70 @@ class MainWindow(QMainWindow):
             self._active_player.seek(fraction * self._active_player.duration)
 
     # ---- fullscreen ----
+    #
+    # "Fullscreen" means the video alone fills the screen: menu bar, playlist
+    # dock, heatmap, seek bar, transport bar and status bar are all hidden.
+    # The window itself is what goes fullscreen (mpv is embedded in
+    # video_widget by X11 window id, and reparenting that native window into a
+    # separate top-level would break the embedding). All QShortcuts belong to
+    # this window, so keyboard control keeps working: Space, arrows, N/P, and
+    # Esc / F / F11 to leave.
+    #
+    # The chrome is driven from the window-state change, not from the toggle
+    # itself, so it also follows fullscreen requested by the window manager
+    # (e.g. a Hyprland fullscreen keybind).
 
     def _toggle_fullscreen(self) -> None:
         if self.isFullScreen():
             self.showNormal()
-            self.fullscreen_btn.setText("Fullscreen")
         else:
             self.showFullScreen()
-            self.fullscreen_btn.setText("Exit Fullscreen")
 
     def _exit_fullscreen(self) -> None:
         if self.isFullScreen():
-            self._toggle_fullscreen()
+            self.showNormal()
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() == QEvent.WindowStateChange:
+            self._apply_fullscreen_chrome(self.isFullScreen())
+
+    def _apply_fullscreen_chrome(self, full: bool) -> None:
+        if full == getattr(self, "_chrome_hidden", False):
+            return
+        self._chrome_hidden = full
+        if full:
+            self._pre_fs = {
+                "dock": self.playlist_dock.isVisible(),
+                "status": self.statusBar().isVisible(),
+                "margins": self.central_layout.contentsMargins(),
+                "spacing": self.central_layout.spacing(),
+            }
+            self.menuBar().hide()
+            self.statusBar().hide()
+            self.playlist_dock.hide()
+            self.heatmap.hide()
+            self.seek_slider.hide()
+            self.transport_bar.hide()
+            self.central_layout.setContentsMargins(0, 0, 0, 0)
+            self.central_layout.setSpacing(0)
+            self.fullscreen_btn.setText("Exit Fullscreen")
+        else:
+            pre = getattr(self, "_pre_fs", None) or {}
+            self.menuBar().show()
+            self.statusBar().setVisible(pre.get("status", True))
+            if pre.get("dock", True):
+                self.playlist_dock.show()
+            self.heatmap.setVisible(self.settings.show_script_heatmap)
+            self.seek_slider.show()
+            self.transport_bar.show()
+            if "margins" in pre:
+                self.central_layout.setContentsMargins(pre["margins"])
+                self.central_layout.setSpacing(pre["spacing"])
+            self.fullscreen_btn.setText("Fullscreen")
+        # keep keyboard focus on the main window rather than a hidden widget
+        self.activateWindow()
+        self.setFocus()
 
     # ---- buttplug ----
 
